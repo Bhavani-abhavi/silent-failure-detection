@@ -172,6 +172,200 @@ seeds so it checks calibration rather than one lucky draw.
 
 ---
 
+## 2026-08-14 — Real data broke the drift core in four ways, one of them silently
+
+**What was done:** loaded the full Lending Club dataset (2,260,668 loans,
+2007-06 to 2018-12, 145 columns) and ran it through the drift core built against
+synthetic data, before building anything on top of it.
+
+**What broke:**
+
+| case | old behaviour | severity |
+|---|---|---|
+| PSI / KL, all-NaN reference | `IndexError` | crash, but loud |
+| Wasserstein, all-NaN reference | `ValueError` | crash, but loud |
+| **KS, all-NaN reference** | **`statistic=nan, is_drifted=False`** | **silent false all-clear** |
+| PSI, all-NaN *or empty* current | `statistic=6.9, is_drifted=True` | plausible number from nothing |
+
+The KS case is the same bug as the permutation floor wearing different clothes:
+a detector that cannot see, reporting that all is well. The PSI case is worse in
+one respect — it could not distinguish "feature vanished" from "window has zero
+rows", and returned an identical, confident, meaningless 6.9 for both.
+
+**Why real data surfaced this and synthetic data could not:** the synthetic
+fixtures always had values. Real feature availability changes over time (see
+next entry), so an all-NaN window is not an edge case in production — it is
+Tuesday.
+
+**What changed:** new `drift_core/validity.py` holding the shared contract, and
+a new `ResultStatus` field on every result. The distinction it encodes:
+
+- **Configuration** errors (knowable without data — permutation floor, a
+  threshold that cannot be exceeded) **raise**. There is no sensible result.
+- **Data** insufficiency (per feature, per window — feature retired, window too
+  small) returns `ResultStatus.INSUFFICIENT_DATA`. A sweep over thousands of
+  feature-windows must not die because one feature was retired upstream, but the
+  result must never be mistaken for a clean pass.
+
+`is_drifted=False` is now insufficient on its own to conclude anything. Callers
+must check `status is OK` first, and `pipeline/monitor.alert_rate` excludes
+non-OK results from the denominator — counting an unevaluable feature as
+evidence of stability is how this bug would come back at the reporting layer.
+
+---
+
+## 2026-08-14 — Lending Club has three schema eras; naive monitoring measures the vendor
+
+**What happened:** feature availability changes twice, sharply.
+
+| era | features | before that date |
+|---|---|---|
+| 2007+ | `loan_amnt`, `int_rate`, `dti`, `revol_util`, … (12) | available throughout |
+| 2013+ | `tot_cur_bal`, `bc_util`, `mort_acc`, `num_sats`, … (16) | **100% null** before 2012 |
+| 2016+ | `open_acc_6m`, `il_util`, `all_util`, `inq_last_12m` (4) | **100% null** before 2015 |
+
+2012 and 2015 are partial-transition years (52% and 95% null respectively).
+
+**Why it matters:** a feature going from absent to fully populated is a vendor
+schema change. Every drift detector fires enormously on it, and the alert is
+*correct* — the data did change — but it says nothing about the model. Monitoring
+across 2013-01 or 2016-01 with a fixed feature list measures Lending Club's data
+vendor, not model degradation.
+
+**What changed:** `domains/finance/lending_club.py` declares the eras explicitly
+and `numeric_features(era)` returns an internally-consistent set. All calibration
+work is confined to a single era. A test asserts every candidate stable window
+starts at or after 2013-01.
+
+**Generalisation to the other domains:** MIMIC-IV will have the same problem in a
+worse form — ICD-9 to ICD-10 transition (2015-10), changing lab panels, and
+changes in what gets charted at all. The era concept is domain-agnostic in shape
+but its boundaries are domain knowledge, so it stays in the adapter. Worth
+checking whether `SchemaEra` should be promoted to shared infrastructure once a
+second domain needs it; one instance is not yet a pattern.
+
+---
+
+## 2026-08-14 — Label maturity is a survivorship trap in the late vintages
+
+**What the data shows** (`label_maturity_report`):
+
+| vintage | n loans | resolved share | default rate among resolved |
+|---|---|---|---|
+| 2014 | 235,629 | 94.0% | 18.5% |
+| 2015 | 421,095 | 88.7% | 20.2% |
+| 2016 | 434,407 | 63.2% | 24.3% |
+| 2017 | 443,579 | 35.8% | 22.9% |
+| 2018 | 495,242 | **9.5%** | **14.7%** |
+
+919,695 loans (41%) are still `Current`.
+
+**The trap:** the 2018 default rate looks like a dramatic improvement. It is not.
+Only 9.5% of that vintage has resolved, and on a 36-60 month product the loans
+that resolve within months are a biased subset, not a sample. The apparent
+improvement is the selection effect.
+
+**What changed:** `default_label` returns **NaN**, not 0, for unresolved loans,
+and a test pins it. Encoding `Current` as "did not default" is the most common
+misuse of this dataset and it biases default rates downward by an amount that
+grows with vintage recency — which reads as a favourable trend.
+
+**Consequence for the headline result:** label-confirmed validation must be
+restricted to vintages with enough seasoning, or use a fixed observation horizon
+(e.g. default within 12 months of origination) applied uniformly. Using
+"whatever has resolved by the snapshot date" would make measured performance a
+function of vintage age. This constrains component 2's validation design and is
+not yet decided.
+
+---
+
+## 2026-08-14 — KS is unusable for alerting at production window sizes
+
+Full write-up: [reports/calibration/THRESHOLD_CALIBRATION.md](../reports/calibration/THRESHOLD_CALIBRATION.md)
+
+**Two measurements, both on Lending Club schema era 2013+:**
+
+| | KS | PSI | Wasserstein |
+|---|---|---|---|
+| Intrinsic FPR (synthetic null, n=20k) | 4.3% | 0.0% | 0.3% |
+| Realistic alert rate (real windows) | **81.0–93.6%** | 0.9–3.6% | 9.5–35.7% |
+
+**What happened:** KS is *correctly calibrated* — 2-4% FPR against nominal 5%
+under a synthetic null at every sample size tested. On real "stable" windows it
+fires on 81-94% of tests.
+
+**Why both are true:** the synthetic null holds the distribution exactly fixed.
+Real quarterly credit data never is. At n=40,000 per window KS detects
+differences far too small to matter operationally. It asks "is there *any*
+difference" and the answer on real data is always yes.
+
+**The design inconsistency this exposed:** `domain_classifier_drift` already
+requires *both* significance (`p < alpha`) and effect size (`auc >= threshold`)
+before alerting — added deliberately because "a significant AUC of 0.53 on 100k
+rows is real and operationally meaningless". `detect_ks_drift` has no such gate;
+it alerts on `p < alpha` alone. The same reasoning applies and was not applied.
+Must be fixed before component 5.
+
+**Not error, and worth stating carefully:** roughly `realistic - intrinsic` is
+genuine drift, so KS is correctly reporting that ~80% of feature-quarters
+contain statistically real movement. It just cannot say which of it matters.
+Multiple-testing correction will not help — the problem is not the family-wise
+error rate, it is that the null being tested is not the question anyone cares
+about.
+
+---
+
+## 2026-08-14 — PSI's 0.1/0.25 thresholds are a sample-size accident
+
+**What happened:** identical thresholds, synthetic null, varying only n:
+
+| rows per half | PSI FPR | null expectation |
+|---|---|---|
+| 250 | **14.6%** | 0.072 |
+| 1,000 | 0.0% | 0.018 |
+| 5,000 | 0.0% | 0.0036 |
+| 20,000 | 0.0% | 0.0009 |
+
+At n=250 the 0.1 watch threshold sits essentially on the noise floor. At
+n=20,000 it is 111x above it, so nothing short of catastrophe trips it — the
+detector is effectively switched off while appearing to be on.
+
+Wasserstein is worse at small n: **50.5% FPR at n=250**, because the normalised
+statistic's null median (0.1002) lands exactly on the 0.1 threshold.
+
+**Conclusion:** the industry convention of quoting PSI 0.1/0.25 with no
+reference to window size is unsupportable. Component 5 must express thresholds
+as a multiple of the analytic noise floor (`psi_null_expectation`,
+`ks_minimum_detectable_effect` in `drift_core/validity.py`), not as constants.
+
+---
+
+## 2026-08-14 — No genuinely stable period exists in Lending Club
+
+Flagged in advance as an acceptable outcome. It is the outcome.
+
+Candidate A (2013H2-2014) is the most defensible window by exogenous criteria —
+ZIRP throughout, no company event, unemployment declining smoothly. It produced
+the **highest** Wasserstein alert rate of any candidate, 35.7% against 9.5-11.9%
+elsewhere.
+
+That is not a detector failure. 2013H2-2014 was Lending Club's steepest growth
+phase, roughly +75% origination volume across the window. The applicant
+population moved a great deal with no macro shock and no scandal.
+
+**The lesson, which generalises beyond this dataset:** absence of an exogenous
+shock does not imply a stable population. The most macro-stable window was the
+least population-stable one. Any monitoring design that assumes "quiet period =
+stable reference" is assuming something that was false here.
+
+**Consequence:** threshold calibration is regime-dependent and the dependence is
+large — Wasserstein 9.8% (period B) vs 35.7% (period A) for identical
+thresholds, a 3.6x alert-volume swing. Every FPR figure from this project must
+be reported as a range with the regime named. Single figures are statements
+about one regime and should not be quoted.
+
+---
+
 ## Open risks (not yet findings — things expected to break)
 
 - **Importance-weighted performance estimation under regime change.** ATC/DoC

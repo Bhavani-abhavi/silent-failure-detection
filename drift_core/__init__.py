@@ -18,8 +18,16 @@ from drift_core.types import (
     DriftKind,
     DriftResult,
     MultivariateDriftResult,
+    ResultStatus,
     Severity,
     WindowSpec,
+)
+from drift_core.validity import (
+    check_windows,
+    coverage,
+    ks_minimum_detectable_effect,
+    psi_null_expectation,
+    require_detectable_alpha,
 )
 from drift_core.univariate import (
     detect_kl_drift,
@@ -36,8 +44,14 @@ __all__ = [
     "DriftKind",
     "DriftResult",
     "MultivariateDriftResult",
+    "ResultStatus",
     "Severity",
     "WindowSpec",
+    "check_windows",
+    "coverage",
+    "ks_minimum_detectable_effect",
+    "psi_null_expectation",
+    "require_detectable_alpha",
     "population_stability_index",
     "kl_divergence",
     "ks_test",

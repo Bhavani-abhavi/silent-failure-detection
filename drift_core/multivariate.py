@@ -36,9 +36,11 @@ from sklearn.model_selection import StratifiedKFold
 from drift_core.types import (
     DriftKind,
     MultivariateDriftResult,
+    ResultStatus,
     Severity,
     WindowSpec,
 )
+from drift_core.validity import require_detectable_alpha
 
 
 def _default_classifier(random_state: int) -> BaseEstimator:
@@ -117,20 +119,10 @@ def domain_classifier_drift(
             f"current has {X_cur.shape[1]}"
         )
 
-    # A permutation test cannot report a p-value below 1/(n_permutations+1).
-    # If that floor sits above alpha, NOTHING can ever reach significance —
-    # a perfectly separable pair of windows (AUC = 1.0) returns "no drift".
-    # That is a silent failure of exactly the kind this project exists to
-    # catch, and it fails quietly at the one moment it matters most, so it
-    # is a hard error rather than a warning.
+    # Configuration guard, shared with every other permutation-based test in
+    # the package (see drift_core/validity.py for why this is centralised).
+    require_detectable_alpha(n_permutations, alpha)
     min_achievable_p = 1.0 / (n_permutations + 1)
-    if min_achievable_p > alpha:
-        raise ValueError(
-            f"n_permutations={n_permutations} cannot produce a p-value below "
-            f"{min_achievable_p:.4f}, so no result can ever reach alpha="
-            f"{alpha}. Use n_permutations >= {int(np.ceil(1 / alpha)) - 1} "
-            f"for alpha={alpha}, or raise alpha."
-        )
 
     X = np.vstack([X_ref, X_cur])
     y = np.concatenate([np.zeros(len(X_ref)), np.ones(len(X_cur))])
@@ -192,6 +184,8 @@ def domain_classifier_drift(
         n_current=len(X_cur),
         is_drifted=is_drifted,
         severity=severity,
+        status=ResultStatus.OK,
+        minimum_detectable_p=min_achievable_p,
         feature_importances=importances,
     )
 

@@ -1,0 +1,13 @@
+period,method,n_windows,n_reference_rows,n_tests,alert_rate,n_not_evaluable
+A_zirp_recovery_2013H2_2014,ks,5,37571,140,0.9357,0
+A_zirp_recovery_2013H2_2014,psi,5,37571,140,0.0143,0
+A_zirp_recovery_2013H2_2014,wasserstein,5,37571,140,0.3571,0
+B_pre_scandal_2015,ks,4,84277,112,0.8571,0
+B_pre_scandal_2015,psi,4,84277,112,0.0089,0
+B_pre_scandal_2015,wasserstein,4,84277,112,0.0982,0
+C_post_scandal_2017,ks,3,96779,84,0.8333,0
+C_post_scandal_2017,psi,3,96779,84,0.0357,0
+C_post_scandal_2017,wasserstein,3,96779,84,0.119,0
+D_narrow_2014,ks,3,47410,84,0.8095,0
+D_narrow_2014,psi,3,47410,84,0.0238,0
+D_narrow_2014,wasserstein,3,47410,84,0.0952,0

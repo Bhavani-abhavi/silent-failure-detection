@@ -48,6 +48,25 @@ class Severity(str, Enum):
     ALERT = "alert"
 
 
+class ResultStatus(str, Enum):
+    """Whether the detector could actually evaluate this feature/window.
+
+    Severity answers "how bad is the drift". Status answers the prior
+    question, "was a verdict possible at all". They are separate fields
+    because collapsing them is precisely how a detector ends up reporting
+    Severity.NONE for a feature it could not see — see drift_core/validity.py
+    for the two occasions that happened here.
+    """
+
+    OK = "ok"
+    INSUFFICIENT_DATA = "insufficient_data"
+    """Not enough present, finite observations to compute the statistic."""
+
+    NO_POWER = "no_power"
+    """Computable, but the configuration cannot detect any effect — the
+    minimum detectable effect exceeds the maximum possible effect."""
+
+
 @dataclass(frozen=True)
 class WindowSpec:
     """Identifies a time window being compared against the reference. Purely
@@ -72,6 +91,16 @@ class DriftResult:
     threshold: float | None = None
     is_drifted: bool = False
     severity: Severity = Severity.NONE
+    status: ResultStatus = ResultStatus.OK
+    """Check this BEFORE reading is_drifted. `is_drifted=False` on a
+    non-OK status means "could not evaluate", not "no drift"."""
+
+    minimum_detectable_effect: float | None = None
+    """The smallest effect this configuration could have detected, in the
+    units of `statistic`. Required by the project rule that every detector
+    state its own sensitivity at call time rather than leaving the reader to
+    assume a null result means the world was quiet."""
+
     n_reference: int = 0
     n_current: int = 0
     extra: dict = field(default_factory=dict)
@@ -95,6 +124,10 @@ class MultivariateDriftResult:
     n_current: int
     is_drifted: bool = False
     severity: Severity = Severity.NONE
+    status: ResultStatus = ResultStatus.OK
+    minimum_detectable_p: float | None = None
+    """1/(n_permutations+1) — the resolution floor of the permutation null."""
+
     feature_importances: dict[str, float] = field(default_factory=dict)
     """Which features the discriminator relied on — the multivariate
     equivalent of "which feature drifted", used for governance reporting."""

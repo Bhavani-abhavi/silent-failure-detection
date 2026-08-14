@@ -52,6 +52,54 @@ All three return CONCEPT_PROXY results. The only thing that produces a
 CONCEPT_CONFIRMED result is `confirm_concept_drift_with_labels`, which runs
 after delayed labels arrive and is the ground truth that the proxies get
 scored against.
+
+
+WHERE THE IMPOSSIBILITY RESULT STOPS — A FUTURE CHANNEL, NOT YET BUILT
+=====================================================================
+
+The result above is scoped precisely, and the scope matters:
+
+    It holds for a FIXED model with NO AUXILIARY OUTCOME SIGNAL.
+
+Both conditions are load-bearing. The second one is not always true in
+practice, and lending is the clearest counterexample.
+
+Between origination and the terminal label (charge-off, or maturity) a
+lender observes *partial outcome* signals: first-payment default, 30/60/90-day
+delinquency, prepayment behaviour, servicing and hardship flags, collection
+contact outcomes. These are not covariates. They are noisy, early,
+partially-observed realisations of the same Y whose relationship to X we
+want to monitor. Conditioning on them therefore does carry genuine
+information about P(Y|X) — which is exactly what no function of P(X) can
+provide.
+
+That makes them a legitimate THIRD category, distinct from both existing
+ones:
+
+    DATA / PREDICTION drift   unsupervised, available immediately
+    LEADING INDICATOR         partially supervised, available in weeks
+    CONCEPT_CONFIRMED         fully supervised, available in months/years
+
+DELIBERATELY NOT BUILT YET. Recorded here so the boundary is understood and
+so nobody later mistakes a leading indicator for an unsupervised signal. If
+it is built, it must be a separate DriftKind and a separate code path — NOT
+folded into CONCEPT_PROXY. The two have completely different epistemic
+status, and merging them would destroy the one property that makes the
+proxies honest: that they are computable with no outcome information
+whatsoever. It would also quietly invalidate the headline detection-latency
+result, which is only meaningful if the signal being timed had no access to
+outcomes.
+
+Two further cautions for whoever picks this up:
+
+  - Early delinquency is itself censored and its reporting lag is not
+    constant across servicers or over time, so "the indicator moved" can
+    mean "the servicer changed its reporting cadence".
+  - In this dataset, `hardship_*` and `settlement_*` columns are exactly
+    these signals. They are excluded from features as leakage — correctly,
+    for a model trained at origination — but they are the raw material a
+    leading-indicator channel would use. Same columns, opposite roles,
+    depending on whether you are predicting or monitoring.
 """
 
 from __future__ import annotations

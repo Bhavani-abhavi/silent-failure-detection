@@ -19,9 +19,20 @@ from __future__ import annotations
 import numpy as np
 from scipy import stats
 
-from drift_core.types import DriftKind, DriftResult, Severity, WindowSpec
-
-ArrayLike = "np.ndarray | list | 'pd.Series'"
+from drift_core.types import (
+    DriftKind,
+    DriftResult,
+    ResultStatus,
+    Severity,
+    WindowSpec,
+)
+from drift_core.validity import (
+    check_windows,
+    insufficient_data_result,
+    ks_minimum_detectable_effect,
+    n_valid,
+    psi_null_expectation,
+)
 
 
 def _as_float_array(values) -> np.ndarray:
@@ -191,11 +202,36 @@ def detect_psi_drift(
     categorical: bool = False,
     watch_threshold: float = 0.1,
     alert_threshold: float = 0.25,
+    min_samples: int = 30,
 ) -> DriftResult:
+    n_ref, n_cur = n_valid(reference), n_valid(current)
+    valid, reason = check_windows(reference, current, min_samples=min_samples)
+    if not valid:
+        return insufficient_data_result(
+            feature_name=feature_name, method="psi", kind=DriftKind.DATA,
+            window=window, reason=reason, n_reference=n_ref, n_current=n_cur,
+        )
+
     psi, extra = population_stability_index(
         reference, current, bins=bins, categorical=categorical
     )
     severity, drifted = _severity(psi, watch_threshold, alert_threshold)
+
+    # The PSI a pair of identical distributions would produce at these sample
+    # sizes. If the watch threshold sits below it, the detector is measuring
+    # sampling noise and the severity below is not trustworthy.
+    noise_floor = psi_null_expectation(n_ref, n_cur, bins)
+    extra["null_expectation"] = noise_floor
+    status = (
+        ResultStatus.NO_POWER if watch_threshold < noise_floor else ResultStatus.OK
+    )
+    if status is ResultStatus.NO_POWER:
+        extra["reason"] = (
+            f"watch_threshold={watch_threshold} is below the null expectation "
+            f"{noise_floor:.4f} at n_ref={n_ref}, n_cur={n_cur}; this "
+            f"configuration fires on sampling noise"
+        )
+
     return DriftResult(
         feature_name=feature_name,
         method="psi",
@@ -205,8 +241,10 @@ def detect_psi_drift(
         threshold=alert_threshold,
         is_drifted=drifted,
         severity=severity,
-        n_reference=len(reference),
-        n_current=len(current),
+        status=status,
+        minimum_detectable_effect=noise_floor,
+        n_reference=n_ref,
+        n_current=n_cur,
         extra=extra,
     )
 
@@ -218,10 +256,29 @@ def detect_ks_drift(
     feature_name: str,
     window: WindowSpec,
     alpha: float = 0.05,
+    min_samples: int = 30,
 ) -> DriftResult:
+    n_ref, n_cur = n_valid(reference), n_valid(current)
+
+    # Without this gate an all-NaN reference window returned
+    # statistic=nan, is_drifted=False — a confident "no drift" verdict on a
+    # feature that had entirely disappeared. Found on real Lending Club data.
+    valid, reason = check_windows(reference, current, min_samples=min_samples)
+    if not valid:
+        return insufficient_data_result(
+            feature_name=feature_name, method="ks", kind=DriftKind.DATA,
+            window=window, reason=reason, n_reference=n_ref, n_current=n_cur,
+        )
+
     statistic, p_value = ks_test(reference, current)
     drifted = p_value < alpha
     severity = Severity.ALERT if drifted else Severity.NONE
+
+    # KS is bounded by 1, so a critical value at or above 1 means even two
+    # completely disjoint distributions could not reach significance.
+    mde = ks_minimum_detectable_effect(n_ref, n_cur, alpha)
+    status = ResultStatus.NO_POWER if mde >= 1.0 else ResultStatus.OK
+
     return DriftResult(
         feature_name=feature_name,
         method="ks",
@@ -232,8 +289,20 @@ def detect_ks_drift(
         threshold=alpha,
         is_drifted=drifted,
         severity=severity,
-        n_reference=len(reference),
-        n_current=len(current),
+        status=status,
+        minimum_detectable_effect=mde,
+        n_reference=n_ref,
+        n_current=n_cur,
+        extra=(
+            {}
+            if status is ResultStatus.OK
+            else {
+                "reason": (
+                    f"KS critical value {mde:.3f} >= 1.0 at n_ref={n_ref}, "
+                    f"n_cur={n_cur}; no difference is detectable at alpha={alpha}"
+                )
+            }
+        ),
     )
 
 
@@ -246,7 +315,16 @@ def detect_wasserstein_drift(
     watch_threshold: float = 0.1,
     alert_threshold: float = 0.25,
     normalize: bool = True,
+    min_samples: int = 30,
 ) -> DriftResult:
+    n_ref, n_cur = n_valid(reference), n_valid(current)
+    valid, reason = check_windows(reference, current, min_samples=min_samples)
+    if not valid:
+        return insufficient_data_result(
+            feature_name=feature_name, method="wasserstein", kind=DriftKind.DATA,
+            window=window, reason=reason, n_reference=n_ref, n_current=n_cur,
+        )
+
     statistic, extra = wasserstein(reference, current, normalize=normalize)
     severity, drifted = _severity(statistic, watch_threshold, alert_threshold)
     return DriftResult(
@@ -258,8 +336,8 @@ def detect_wasserstein_drift(
         threshold=alert_threshold,
         is_drifted=drifted,
         severity=severity,
-        n_reference=len(reference),
-        n_current=len(current),
+        n_reference=n_ref,
+        n_current=n_cur,
         extra=extra,
     )
 
@@ -274,9 +352,20 @@ def detect_kl_drift(
     categorical: bool = False,
     watch_threshold: float = 0.1,
     alert_threshold: float = 0.25,
+    min_samples: int = 30,
 ) -> DriftResult:
+    n_ref, n_cur = n_valid(reference), n_valid(current)
+    valid, reason = check_windows(reference, current, min_samples=min_samples)
+    if not valid:
+        return insufficient_data_result(
+            feature_name=feature_name, method="kl_divergence", kind=DriftKind.DATA,
+            window=window, reason=reason, n_reference=n_ref, n_current=n_cur,
+        )
+
     kl, extra = kl_divergence(reference, current, bins=bins, categorical=categorical)
     severity, drifted = _severity(kl, watch_threshold, alert_threshold)
+    noise_floor = psi_null_expectation(n_ref, n_cur, bins)
+    extra["null_expectation"] = noise_floor
     return DriftResult(
         feature_name=feature_name,
         method="kl_divergence",
@@ -286,7 +375,8 @@ def detect_kl_drift(
         threshold=alert_threshold,
         is_drifted=drifted,
         severity=severity,
-        n_reference=len(reference),
-        n_current=len(current),
+        minimum_detectable_effect=noise_floor,
+        n_reference=n_ref,
+        n_current=n_cur,
         extra=extra,
     )
