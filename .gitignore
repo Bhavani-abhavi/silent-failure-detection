@@ -1,0 +1,27 @@
+# Environments
+.venv/
+venv/
+*.egg-info/
+__pycache__/
+*.py[cod]
+
+# Data — never commit. MIMIC-IV is credentialed access and redistribution is
+# prohibited by its DUA; Lending Club and commercial extracts are large and
+# reproducible from scripts/. Keep the loaders in git, not the bytes.
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
