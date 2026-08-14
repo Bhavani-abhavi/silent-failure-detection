@@ -5,16 +5,18 @@ venv/
 __pycache__/
 *.py[cod]
 
-# Data — never commit. MIMIC-IV is credentialed access and redistribution is
-# prohibited by its DUA; Lending Club and commercial extracts are large and
-# reproducible from scripts/. Keep the loaders in git, not the bytes.
+# Data - never commit. loan.csv is ~1.1 GB and freely downloadable; the
+# derived parquet is reproducible from scripts/. Keep the loaders in git,
+# not the bytes. Report CSVs under reports/ ARE committed deliberately: they
+# are the evidence behind the numbers in the README.
 data/raw/*
 data/processed/*
 !data/raw/.gitkeep
 !data/processed/.gitkeep
 
-# Test / coverage
+# Test / lint / coverage
 .pytest_cache/
+.import_linter_cache/
 .coverage
 htmlcov/
 

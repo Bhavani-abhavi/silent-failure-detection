@@ -16,14 +16,22 @@ from __future__ import annotations
 
 import numpy as np
 
-from drift_core.types import DriftKind, DriftResult, Severity, WindowSpec
+from dataclasses import replace
+
+from drift_core.types import DriftKind, DriftResult, WindowSpec
 from drift_core.univariate import (
-    ks_test,
-    population_stability_index,
-    wasserstein,
+    detect_ks_drift,
+    detect_psi_drift,
+    detect_wasserstein_drift,
 )
 
 PREDICTION_FEATURE_NAME = "__prediction__"
+
+_METHODS = {
+    "psi": detect_psi_drift,
+    "ks": detect_ks_drift,
+    "wasserstein": detect_wasserstein_drift,
+}
 
 
 def detect_prediction_drift(
@@ -32,70 +40,38 @@ def detect_prediction_drift(
     *,
     window: WindowSpec,
     method: str = "psi",
-    bins: int = 10,
-    watch_threshold: float = 0.1,
-    alert_threshold: float = 0.25,
-    alpha: float = 0.05,
+    **kwargs,
 ) -> DriftResult:
     """Drift on the model's output scores.
 
     `method` is one of "psi", "ks", "wasserstein". PSI is the default because
-    it is the one most commonly reported to model-risk functions, and its
-    bins are fixed from the reference window (so the statistic is comparable
-    across monitoring windows rather than being re-derived each time).
+    it is the one most commonly reported to model-risk functions, and its bins
+    are fixed from the reference window, so the statistic stays comparable
+    across monitoring windows rather than being re-derived each time.
+
+    This delegates to the univariate detectors rather than reimplementing the
+    threshold logic. It previously did reimplement it, and drifted out of
+    sync: when the univariate detectors gained the requirement that both a
+    significance gate and an effect-size gate be passed before firing, this
+    function kept alerting on `p < alpha` alone for KS and on effect size
+    alone for PSI and Wasserstein. Prediction drift is the signal closest to
+    the headline claim, so it was the worst place to keep a weaker rule.
     """
-    ref = np.asarray(reference_scores, dtype=float)
-    cur = np.asarray(current_scores, dtype=float)
-
-    p_value: float | None = None
-    extra: dict = {}
-
-    if method == "psi":
-        statistic, extra = population_stability_index(ref, cur, bins=bins)
-        drifted = statistic >= watch_threshold
-        severity = (
-            Severity.ALERT
-            if statistic >= alert_threshold
-            else Severity.WATCH
-            if drifted
-            else Severity.NONE
-        )
-        threshold = alert_threshold
-    elif method == "ks":
-        statistic, p_value = ks_test(ref, cur)
-        drifted = p_value < alpha
-        severity = Severity.ALERT if drifted else Severity.NONE
-        threshold = alpha
-    elif method == "wasserstein":
-        statistic, extra = wasserstein(ref, cur)
-        drifted = statistic >= watch_threshold
-        severity = (
-            Severity.ALERT
-            if statistic >= alert_threshold
-            else Severity.WATCH
-            if drifted
-            else Severity.NONE
-        )
-        threshold = alert_threshold
-    else:
+    if method not in _METHODS:
         raise ValueError(
-            f"unknown method {method!r}; expected 'psi', 'ks', or 'wasserstein'"
+            f"unknown method {method!r}; expected one of {sorted(_METHODS)}"
         )
-
-    return DriftResult(
+    result = _METHODS[method](
+        reference_scores,
+        current_scores,
         feature_name=PREDICTION_FEATURE_NAME,
-        method=f"prediction_{method}",
-        statistic=float(statistic),
-        kind=DriftKind.PREDICTION,
         window=window,
-        p_value=p_value,
-        threshold=threshold,
-        is_drifted=drifted,
-        severity=severity,
-        n_reference=len(ref),
-        n_current=len(cur),
-        extra=extra,
+        **kwargs,
     )
+    # Same statistic, different operational meaning: input drift may be
+    # harmless, output drift means the composition of the model's decisions
+    # changed, which is what downstream processes actually feel.
+    return replace(result, kind=DriftKind.PREDICTION, method=f"prediction_{method}")
 
 
 def mean_score_shift(reference_scores, current_scores) -> dict:

@@ -366,6 +366,376 @@ about one regime and should not be quoted.
 
 ---
 
+## 2026-08-14 — The maturity fix is a fixed horizon, not a tail trim, and it *recovers* data
+
+**The decision the previous entry left open.** Four rules were measured against
+the raw file rather than argued about:
+
+| rule | issue cutoff | rows kept (era 2013+) | quarters | share of eventual charge-offs captured |
+|---|---|---|---|---|
+| 12-month horizon | 2018-03 | 1.78M (82%) | 21 | 42.9% |
+| **24-month horizon** | **2017-03** | **1.32M (61%)** | **17** | **80.5%** |
+| full 36-mo term, 36-mo loans only | 2016-03 | 642k (30%) | 13 | ~100% |
+| full maturity, all terms | 2014-03 | 182k (8%) | 5 | 100% |
+
+**The measurement that decided it:** among charged-off loans the median gap from
+origination to last payment is **14 months**, and only 42.9% stop paying inside
+12 months. The obvious 12-month horizon would have defined away 57% of the risk
+it claimed to measure. Full 36-month maturity forces dropping every 60-month
+loan — a systematically riskier population, so the model's scope narrows — and
+leaves too few windows to measure a latency in.
+
+**The non-obvious part:** a fixed horizon is not the same move as cutting the
+recent tail. Cutting the tail keeps only resolved loans and throws the 919,695
+`Current` loans away. A fixed horizon *recovers them as valid negatives* — a
+loan that would have defaulted inside 24 months would already read
+`Charged Off`, so one still `Current` at 28+ months has genuinely survived.
+Inside the observable range there is no maturity bias left to correct, not
+merely less of it. Labelled share of the kept data is **100.0000%**.
+
+**What it cost, measured** (`scripts/report_maturity_cut.py`):
+
+- 1,285,664 rows kept of 2,260,668 — **56.9%**, discarding 975,004
+- issue_d 2007-06 .. **2016-11** (snapshot 2019-03, cutoff = snapshot − 24 − 4)
+- 39 quarters total; monitoring is confined to schema era 2013+, so **2013-01
+  .. 2016-10** is the usable range
+- overall 24-month default rate 12.75%, 163,917 positives
+
+**The bias, before and after.** Same vintages, two label definitions:
+
+| vintage | snapshot-resolved rate | 24-mo horizon rate |
+|---|---|---|
+| 2013 | 15.60% | 10.66% |
+| 2014 | 18.54% | 11.95% |
+| 2015 | 20.16% | 13.38% |
+| 2016 | 24.27% | 13.65% |
+| 2017 | 22.90% | *not observable* |
+| 2018 | **14.73%** | *not observable* |
+
+The snapshot column has the wrong sign at the end, exactly as predicted — 2018
+reads as the second-best vintage on record when only 9.5% of it has resolved.
+The horizon column is monotone and modest.
+
+**The booking-lag buffer, and why it is not decoration.** Lending Club books a
+charge-off at ~120+ days delinquent, so a loan that stops paying in month 24
+does not *show* as charged off until ~month 28. Without the 4-month buffer the
+newest kept vintage would be under-labelled — the same survivorship bias pushed
+to the boundary instead of the tail. Measured residual with the buffer in place:
+**319 loans, 0.025% of kept rows**, stopped paying inside the horizon but are
+still `Late` rather than charged off and are labelled 0. Small enough to state
+and move on; it is reported by `horizon_maturity_report` rather than assumed.
+
+**What is honestly given up:** this measures 24-month default, not lifetime
+default. 19.5% of eventual charge-offs happen after month 24 and are labelled 0
+here. That is a real limitation of the ground truth and every result in this
+repo inherits it.
+
+**Two consequences carried forward:**
+
+1. **2016Q4 is a partial quarter** (cutoff falls at 2016-11-01, so only Oct–Nov).
+   Its default rate reads 12.31% against 14.35% in 2016Q3, and some of that gap
+   is composition rather than signal. Incomplete boundary windows must be
+   dropped by the backtest, not analysed.
+2. **The target moves, which is the precondition for the whole project.**
+   Quarterly 24-month default rate runs 10.39% (2013Q4) → 14.35% (2016Q3), a
+   monotone ~38% relative increase. Whether that degrades *model discrimination*
+   (AUC) rather than just the base rate is a separate question and is not yet
+   answered — a rising base rate alone does not degrade ranking performance.
+
+---
+
+## 2026-08-14 — The model does not degrade on AUC. It degrades on calibration, badly.
+
+This is the load-bearing finding of the project and it invalidated the metric
+the headline was originally designed around.
+
+**Setup:** baseline `HistGradientBoostingClassifier`, 28 numeric + 6
+categorical origination-time features, trained on 2013-01..2013-06 (53,374
+loans), reference holdout 2013-07..2013-12 (81,440, never trained on), then
+frozen and scored across 35 monthly windows to 2016-11 (1,054,948 loans).
+Labels are the 24-month horizon label throughout.
+
+**Discrimination is flat. There is no AUC degradation to detect.**
+
+| | AUC |
+|---|---|
+| reference holdout (2013 H2) | 0.6719 |
+| final window (2016-11) | 0.6661 |
+| worst window (2014-01) | 0.6522 |
+| mean, first half of monitoring | 0.6740 |
+| mean, second half | **0.6832** |
+
+Second half is *better* than first half by +0.0092. Total drift −0.0059, well
+inside window-to-window noise. Had the project defined "true performance drop"
+as an AUC decline — the default choice, and the one the original design
+assumed — the honest answer would have been "no drop ever occurred, the
+headline cannot be computed" and that would have been the entire result.
+
+**Calibration degrades substantially, and in the dangerous direction.**
+
+| | Brier | base rate | mean predicted | gap |
+|---|---|---|---|---|
+| reference (2013 H2) | 0.0916 | 0.1054 | 0.1035 | −0.0019 |
+| 2015-12 | 0.1190 | 0.1434 | 0.0921 | **−0.0513** |
+| 2016-05 | 0.1171 | 0.1415 | 0.0952 | −0.0463 |
+| 2016-11 | 0.1069 | 0.1256 | 0.0997 | −0.0259 |
+
+Brier rises 0.0916 → 0.1069, **+17% relative**. The calibration gap widens
+from −0.0019 to −0.0513, a **27x** growth. At the worst point the model
+under-states portfolio default risk by roughly 36% relative.
+
+**This is label-confirmed concept drift, and the direction proves it.** If the
+applicant pool had simply become riskier — a pure `P(X)` shift — the model
+would have seen the riskier inputs and its mean prediction would have risen
+with the base rate. The opposite happened: the base rate rose (0.1054 →
+0.1256, +19%) while mean predicted risk *fell* (0.1035 → 0.0997). The
+observable covariates say "slightly safer"; the outcomes say "materially
+riskier". The same X defaults more than it used to. That is a change in
+`P(Y|X)`, and it is confirmable here only because matured labels are in hand —
+consistent with the impossibility result, not in tension with it.
+
+**Why this is the better result, not a consolation prize.** A model whose
+ranking is intact and whose probabilities have drifted 36% low is the precise
+technical meaning of *silent failure*. Every standard monitoring dashboard
+watches AUC. This model would have passed AUC monitoring for three years while
+systematically under-pricing risk — which for a credit model is the failure
+that costs money, since approval cutoffs and pricing consume the probability,
+not the rank.
+
+**What changed as a result:**
+
+1. **"True performance drop" is defined on Brier score and the calibration
+   gap, not AUC.** Both are reported in every window
+   (`model.baseline.evaluate` returns AUC, Brier, base rate, and mean
+   prediction together, deliberately) and the AUC null result is reported
+   next to the headline rather than buried.
+2. **Monthly windows, not quarterly.** All 35 are complete under the maturity
+   cut, and latency in months is a more useful number than latency in
+   quarters. The partial-quarter artifact noted in the maturity entry affects
+   quarterly aggregation only.
+3. **Component B's expected failure mode is now specific and predictable.**
+   Confidence-based performance estimation reads the model's own probabilities
+   to infer how it is doing. Those probabilities are exactly what is broken
+   here. A confidence-based estimator should therefore be *structurally blind*
+   to this degradation — it should report that everything is fine, right
+   through a 36% under-pricing. That is a testable prediction and B is built
+   to test it rather than to succeed.
+
+**Corroboration worth noting:** the 2016-07 window is the first sharp break in
+several series at once — AUC falls to 0.6647, mean prediction jumps back to
+0.1031 from 0.0897. That is two months after Lending Club's CEO resigned
+(2016-05, already recorded in `domains/finance/stable_periods.py` as a
+structural break, before any of this was measured).
+
+---
+
+## 2026-08-14 — The ESS guardrail was disabled by the clipping meant to protect it
+
+**How it surfaced:** `test_no_common_support_suppresses_every_metric` built two
+windows six standard deviations apart — no meaningful support overlap — and
+expected the importance-weighted estimator to suppress itself. It returned a
+confident base rate of **0.534** instead, with a healthy-looking effective
+sample size.
+
+**Cause:** the density-ratio fitter clips weights at the 99th percentile to
+control variance, and effective sample size was computed *after* the clip.
+Clipping caps exactly the enormous weights that ESS exists to detect. On a
+window with almost no overlap the raw ratios span orders of magnitude; after
+clipping they are bounded and evenly spread, and Kish ESS reads as healthy.
+The guardrail was measuring the output of its own variance control.
+
+**Why it belongs in this log rather than a commit message:** this is the same
+failure as the permutation floor and the all-NaN KS result, in a third
+costume — a check that cannot see, reporting that all is well. Three
+independent instances in one codebase is a pattern, not bad luck. The common
+shape: *a safety check computed downstream of a transformation that removes
+the evidence it looks for.*
+
+**What changed:**
+
+1. ESS is computed on **unclipped** ratios, before the cap is applied. Pinned
+   by `test_ess_is_measured_before_clipping`, which fails if the computation
+   is ever moved back below the clip during a tidy-up.
+2. A second, independent guardrail: the **discriminator AUC**. Importance
+   weighting requires common support, and separability is the direct test of
+   it — an AUC near 1 means a classifier can tell every reference row from
+   every current row, so the density ratio is extrapolating rather than
+   reweighting. On the failing case it read 0.9996, which was already sitting
+   in the diagnostics under a misleading name (`discriminator_auc_proxy`,
+   which was actually just a mean predicted probability, not an AUC).
+
+Both fire on the test case. They are redundant there and independent in
+general, which is the argument for keeping both.
+
+---
+
+## 2026-08-14 — Component B: the label-free estimators did not just fail, they pointed the wrong way
+
+Predicted in the AUC/calibration entry above, before the estimators were run:
+"a confidence-based estimator should be structurally blind to this
+degradation — it should report that everything is fine." The prediction was
+too generous.
+
+**Measured over 35 monthly windows, against matured 24-month labels:**
+
+| metric | method | coverage | mean relative error | worst | same direction every window? |
+|---|---|---|---|---|---|
+| base rate | average confidence | 35/35 | **−23.4%** | 35.7% | yes |
+| Brier | average confidence | 35/35 | **−24.5%** | 35.2% | yes |
+| base rate | importance weighted | **4/35** | −19.2% | 30.5% | yes |
+| Brier | importance weighted | 4/35 | −18.0% | 28.5% | yes |
+
+**Not blind — anti-correlated.** Correlation between the label-free estimate
+and the truth it is estimating:
+
+- base rate: **r = −0.38**
+- Brier: **r = −0.46**
+
+The estimate moved *against* the truth. As the model's real performance
+decayed, the estimator reported it improving. A flat estimator would have been
+uninformative; this one is actively misleading, and a monitoring system built
+on it would have produced a reassuring downward trend line through the worst
+of the degradation.
+
+The mechanism is visible in one number: `corr(mean predicted risk, true base
+rate) = −0.38`. Mean predicted risk drifted 0.1007 → 0.0897 → 0.0997 while the
+true base rate went 0.1056 → 0.1466. The estimators are functionals of the
+predicted probabilities, so they inherit that sign exactly.
+
+**Importance weighting did not rescue it, and the way it failed is the useful
+part.** This was the sharp experiment: importance weighting is *valid* under
+covariate shift, so if it had fixed the estimate, the degradation would have
+been a `P(X)` problem and the model would have been fine.
+
+It answered **4 of 35 windows** and suppressed the rest. The discriminator AUC
+between reference and current windows ran 0.897 at 2014-01 to **0.9998** by the
+end — reference and current become almost perfectly separable, so there is no
+common support to reweight across and the density ratio is extrapolation.
+**Importance-weighted estimation had a shelf life of four months on this
+data.** On the four windows it was willing to answer it was still wrong by
+−19%, still in the same direction.
+
+That is the empirical counterpart to the impossibility argument. Correcting
+for everything observable about `P(X)` left the error essentially intact,
+because the error was in `P(Y|X)`.
+
+**Accuracy estimation is measuring nothing here, and that indicts a whole
+literature branch on this kind of target.** ATC and difference-of-confidences
+estimate *accuracy*. On a 12% base rate the model crosses the 0.5 threshold on
+0.15–0.50% of loans, so accuracy is arithmetically pinned to the majority
+class: `corr(accuracy, 1 − base_rate) = 0.9994`. ATC's estimate looks
+respectable (+2.5% error, r = 0.05) precisely because it is tracking a
+quantity that carries no information about the model. Reporting an accuracy
+estimator as "working" on imbalanced credit data would be the most easily
+missed error in this project.
+
+**What was NOT done:** none of these estimators were tuned. The first
+configuration run is the configuration reported. Tuning against the validation
+set is the specific thing component B exists to avoid, and a −23% error found
+honestly is worth more than a 5% error found by fitting to the answer.
+
+---
+
+## 2026-08-14 — Component C, THE HEADLINE: no unsupervised signal gave genuine early warning
+
+**The number the project was built to produce, stated plainly: on this data
+the answer is zero, and two of the six signals report a positive latency only
+because they were already firing.**
+
+**Onset of label-confirmed degradation** (3 SD above the healthy reference
+band, sustained 2 windows; reference statistics from the six holdout months
+only, computed before any signal was scored):
+
+| onset metric | onset window | index | windows breaching |
+|---|---|---|---|
+| Brier | 2014-03 | 2 | 33 / 35 |
+| calibration gap | 2014-05 | 4 | 31 / 35 |
+| AUC | **never** | — | 0 / 35 |
+
+**Latency, against the calibration-gap onset:**
+
+| signal | latency | first fire | pre-onset alert rate | total alert rate |
+|---|---|---|---|---|
+| KS | +4 | 2014-01 | **100%** | **100%** |
+| Wasserstein | +4 | 2014-01 | **100%** | **100%** |
+| multivariate | +4 | 2014-01 | **100%** | **100%** |
+| PSI | +2 | 2014-03 | 50% | 85.7% |
+| KL | +2 | 2014-03 | 50% | 85.7% |
+| prediction drift | — | never | 0% | **0%** |
+
+KS, Wasserstein, and the domain classifier fired on the **first monitoring
+window and every window after it**. Their "+4 windows of lead time" is not a
+detection; it is an always-on detector being credited for the alarm it never
+stopped ringing. `backtest/latency.py` reports the pre-onset alert rate
+alongside the latency specifically so this cannot be quoted as a success — a
+detector that fires on 100% of windows has maximum lead time on every event
+and zero information.
+
+PSI and KL are the only signals with a defensible profile, and they achieved
+**+2 windows** — with half their pre-onset windows alerting, and with a drift
+share of 1 feature out of 28 for most of the period.
+
+**Prediction drift never fired, and this is the finding, not a bug.** Max PSI
+on the score distribution across 35 windows was **0.0894**, under the 0.1
+effect gate. The model's output distribution barely moved while its true error
+grew 27-fold, because the covariates did not move in the direction of risk —
+the *relationship* did. Prediction drift is a function of `P(X)`, and the
+failure was in `P(Y|X)`. Constraint 1 is not merely a caveat in this project's
+README; it is the measured outcome. (Honest caveat: at a 0.05 gate prediction
+drift would fire on 11/35 windows, so the "never" is threshold-dependent, not
+absolute. It still would not have led the onset.)
+
+**The false-positive rate is 0.0%, which makes the above worse, not better.**
+Against a synthetic null — random splits of the healthy reference period, 560
+feature-window tests per method — all four univariate detectors alerted **zero
+times**. The detectors are correctly calibrated. They fire constantly on real
+data because real credit populations genuinely never stop moving, not because
+the tests are broken. This is the same finding as the earlier KS entry,
+surviving the addition of effect-size gates: the gates cut PSI/KL from
+always-on to 85.7% and the first two windows to silent, but left KS and
+Wasserstein at 100%.
+
+### The part that is actually useful: the thresholding destroys the signal, not the statistic
+
+Correlation of each **continuous** statistic with the true calibration gap
+across the 35 windows:
+
+| statistic | r vs calibration gap | r vs Brier |
+|---|---|---|
+| **multivariate AUC** | **0.88** | 0.80 |
+| Wasserstein drift share | 0.78 | 0.66 |
+| KS drift share | 0.75 | 0.67 |
+| prediction PSI | 0.74 | 0.49 |
+| PSI drift share | 0.41 | 0.43 |
+
+The domain-classifier AUC rises monotonically 0.636 → 0.803 and tracks the
+degradation at r = 0.88. As a *binary alert* it is worthless — it is above
+threshold from window one. As a *continuous severity index* it is the best
+signal in the project.
+
+So the failure is not that unsupervised signals carry no information about
+this degradation. They carry a lot. The failure is that converting them to
+alerts with a fixed threshold produces either "always on" or "never on", and
+neither has a latency worth reporting. **A monitoring design that reports
+trend and rate-of-change rather than threshold crossings would have been
+usable here; the one that was built, which is the industry-standard one, was
+not.**
+
+### Why the latency question was partly unanswerable on this data
+
+The runway was 2–4 windows because degradation began **immediately**: 33 of 35
+monitoring windows breach the Brier threshold, starting two months after the
+training window ends. There was never a healthy deployment period to detect
+across.
+
+That is worth more than the number it prevented. The detection-latency framing
+assumes a model that works for a while and then breaks. This model was
+degrading from the moment it was deployed, which is what "the world was already
+moving when you trained" looks like — and it is probably the common case rather
+than the exception.
+
+---
+
 ## Open risks (not yet findings — things expected to break)
 
 - **Importance-weighted performance estimation under regime change.** ATC/DoC

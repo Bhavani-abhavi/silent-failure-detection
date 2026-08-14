@@ -45,6 +45,7 @@ must render non-OK results as a distinct category — not folded into the
 from __future__ import annotations
 
 import numpy as np
+from scipy import stats
 
 from drift_core.types import DriftKind, DriftResult, ResultStatus, Severity, WindowSpec
 
@@ -142,6 +143,92 @@ def psi_null_expectation(n_ref: int, n_cur: int, bins: int) -> float:
     if n_ref <= 0 or n_cur <= 0:
         return float("inf")
     return float((bins - 1) * (1.0 / n_ref + 1.0 / n_cur))
+
+
+def psi_p_value(psi: float, n_ref: int, n_cur: int, bins: int) -> float:
+    """Probability of a PSI this large under "nothing changed".
+
+    PSI is asymptotically `(1/n_ref + 1/n_cur) * chi2(bins - 1)`, so dividing
+    by the scale factor gives a chi-square variate directly. `bins` must be the
+    *realized* bin count, not the requested one — quantile edges collapse on
+    ties, and using the requested count would overstate the degrees of freedom
+    and make the test anti-conservative on exactly the lumpy, heavily-tied
+    features where it is most likely to be wrong.
+    """
+    scale = 1.0 / n_ref + 1.0 / n_cur
+    df = bins - 1
+    if df < 1 or scale <= 0 or not np.isfinite(psi):
+        return float("nan")
+    return float(stats.chi2.sf(psi / scale, df=df))
+
+
+def kl_p_value(kl: float, n_ref: int, n_cur: int, bins: int) -> float:
+    """Same asymptotic, halved.
+
+    PSI is exactly the symmetrized KL — `sum((c-r)(log c - log r))` expands to
+    `KL(c||r) + KL(r||c)` — and under the null the two halves have the same
+    expectation. So `2 * KL` inherits PSI's null distribution. Verified against
+    simulation rather than left as algebra in
+    `test_univariate.py::TestAsymptoticNullCalibration`.
+    """
+    return psi_p_value(2.0 * kl, n_ref, n_cur, bins)
+
+
+def permutation_p_value(
+    reference,
+    current,
+    statistic_fn,
+    *,
+    n_permutations: int = 199,
+    max_samples: int = 5000,
+    random_state: int | None = None,
+) -> tuple[float, float, int]:
+    """Permutation null for a statistic with no usable asymptotic form.
+
+    Returns `(p_value, observed_at_capped_n, n_per_side)`.
+
+    THE CAP IS LORE, NOT AN OPTIMISATION
+    ------------------------------------
+    Both windows are subsampled to `max_samples` per side, and the observed
+    statistic is recomputed on that same subsample. Building the null at a
+    reduced n while comparing it against a statistic computed at full n would
+    be a serious error in the *anti*-conservative direction for any statistic
+    that shrinks with n — the full-n observed value would sit deep inside a
+    null built from noisier small-n draws, and the test would essentially
+    never reject no matter how large the true shift.
+
+    The price is honest and one-directional: at capped n the test has less
+    power than the data could support, so it under-fires rather than
+    over-fires. Callers get the full-n effect size separately, which is the
+    number that should be doing the work anyway.
+    """
+    rng = np.random.default_rng(random_state)
+
+    ref = np.asarray(reference, dtype=float)
+    cur = np.asarray(current, dtype=float)
+    ref = ref[np.isfinite(ref)]
+    cur = cur[np.isfinite(cur)]
+
+    n_per_side = int(min(max_samples, len(ref), len(cur)))
+    if n_per_side < 2:
+        return float("nan"), float("nan"), n_per_side
+
+    ref_s = rng.choice(ref, size=n_per_side, replace=False)
+    cur_s = rng.choice(cur, size=n_per_side, replace=False)
+    observed = float(statistic_fn(ref_s, cur_s))
+
+    pool = np.concatenate([ref_s, cur_s])
+    at_least_as_extreme = 0
+    for _ in range(n_permutations):
+        rng.shuffle(pool)
+        if float(statistic_fn(pool[:n_per_side], pool[n_per_side:])) >= observed:
+            at_least_as_extreme += 1
+
+    # +1 in both terms: the observed arrangement is itself one of the
+    # permutations, and omitting it makes p=0 reachable, which is a claim no
+    # finite permutation test can support.
+    p_value = (at_least_as_extreme + 1) / (n_permutations + 1)
+    return float(p_value), observed, n_per_side
 
 
 def insufficient_data_result(

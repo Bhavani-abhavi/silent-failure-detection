@@ -24,7 +24,9 @@ Three hazards in this dataset that any honest use has to handle:
    in recent vintages. Restricting to resolved loans therefore selects, in
    late vintages, for loans that resolved *early* — early payoff or early
    default — which is a survivorship bias, not a sample. `default_label`
-   exposes this rather than hiding it.
+   exposes this rather than hiding it, and
+   `default_label_within_horizon` is the version anything downstream should
+   actually use.
 """
 
 from __future__ import annotations
@@ -96,6 +98,42 @@ CATEGORICAL_FEATURES: list[str] = [
 TIME_COLUMN = "issue_d"
 STATUS_COLUMN = "loan_status"
 
+# --------------------------------------------------------------------------
+# Label construction. These columns are post-origination and are loaded for
+# one purpose only: to build and *time* the outcome. They must never appear
+# in a feature list — `tests/domains/test_lending_club.py` pins that.
+# --------------------------------------------------------------------------
+
+LAST_PAYMENT_COLUMN = "last_pymnt_d"
+LAST_CREDIT_PULL_COLUMN = "last_credit_pull_d"
+
+LABEL_COLUMNS: list[str] = [
+    STATUS_COLUMN,
+    LAST_PAYMENT_COLUMN,
+    LAST_CREDIT_PULL_COLUMN,
+]
+
+DEFAULT_HORIZON_MONTHS = 24
+"""Outcome window: did the loan stop paying within 24 months of origination?
+
+Chosen against measurement, not convention. Among charged-off loans the
+median gap from origination to last payment is 14 months, and only 42.9%
+stop paying inside 12 months — so a 12-month horizon would define away most
+of the risk it claims to measure. 24 months captures 80.5%. Going further
+(full 36-month term) captures ~100% but forces dropping every 60-month loan
+and costs 70% of the rows, leaving too few quarters to measure a latency in.
+"""
+
+CHARGEOFF_BOOKING_LAG_MONTHS = 4
+"""Lending Club books a charge-off at roughly 120+ days delinquent.
+
+A loan that stops paying in month 24 therefore does not *show* as charged
+off until about month 28. Without this buffer the most recent kept vintage
+would be systematically under-labelled — its late defaults not yet visible —
+which is the same survivorship bias the horizon exists to remove, just
+pushed to the boundary instead of the tail.
+"""
+
 RESOLVED_BAD = {
     "Charged Off",
     "Default",
@@ -166,20 +204,26 @@ def load(
     paying the CSV parse each time discourages re-running them.
     """
     features = numeric_features(era)
+    # The cache name carries a schema version. When the loaded column set
+    # changes, a stale parquet from a previous version would load fine and
+    # then fail somewhere far away with a missing column — bump the version
+    # instead of relying on anyone remembering to clear data/processed.
     cache_path = (
-        Path("data/processed") / f"lending_club_{era.replace('+', 'plus')}.parquet"
+        Path("data/processed")
+        / f"lending_club_{era.replace('+', 'plus')}_v2.parquet"
     )
     if cache and nrows is None and cache_path.exists():
         return pd.read_parquet(cache_path)
 
-    columns = features + [TIME_COLUMN, STATUS_COLUMN]
+    columns = features + [TIME_COLUMN] + LABEL_COLUMNS
     if include_categoricals:
         columns += CATEGORICAL_FEATURES
 
     frame = pd.read_csv(path, usecols=columns, low_memory=False, nrows=nrows)
-    frame[TIME_COLUMN] = pd.to_datetime(
-        frame[TIME_COLUMN], format="%b-%Y", errors="coerce"
-    )
+    for column in (TIME_COLUMN, LAST_PAYMENT_COLUMN, LAST_CREDIT_PULL_COLUMN):
+        frame[column] = pd.to_datetime(
+            frame[column], format="%b-%Y", errors="coerce"
+        )
     frame = frame.dropna(subset=[TIME_COLUMN])
 
     # int_rate and revol_util arrive as strings with a percent sign in some
@@ -218,6 +262,181 @@ def default_label(frame: pd.DataFrame) -> pd.Series:
     label[status.isin(RESOLVED_BAD)] = 1.0
     label[status.isin(RESOLVED_GOOD)] = 0.0
     return label
+
+
+def snapshot_date(frame: pd.DataFrame) -> pd.Timestamp:
+    """The date this extract was pulled, inferred from the data itself.
+
+    Hardcoding it would be a silent time bomb: re-run against a later
+    Lending Club extract and every maturity calculation would quietly be
+    computed against the wrong "now" while still producing numbers.
+    """
+    observed = [
+        frame[column].max()
+        for column in (LAST_CREDIT_PULL_COLUMN, LAST_PAYMENT_COLUMN)
+        if column in frame.columns
+    ]
+    observed = [value for value in observed if pd.notna(value)]
+    if not observed:
+        raise ValueError(
+            f"cannot infer snapshot date: none of {LABEL_COLUMNS} are present "
+            f"and populated. Load with the label columns included."
+        )
+    return max(observed)
+
+
+def _months_between(start: pd.Series, end: pd.Series) -> pd.Series:
+    """Whole calendar months from `start` to `end`.
+
+    Both columns are month-precision in the source (`Dec-2015`), so a day-
+    based difference would invent precision the data does not have.
+    """
+    return (end.dt.year - start.dt.year) * 12 + (end.dt.month - start.dt.month)
+
+
+def maturity_cutoff(
+    frame: pd.DataFrame | None = None,
+    *,
+    horizon_months: int = DEFAULT_HORIZON_MONTHS,
+    booking_lag_months: int = CHARGEOFF_BOOKING_LAG_MONTHS,
+    snapshot: str | pd.Timestamp | None = None,
+) -> pd.Timestamp:
+    """Latest origination date whose `horizon_months` outcome is fully observable."""
+    if snapshot is not None:
+        snapshot_ts = pd.Timestamp(snapshot)
+    elif frame is not None:
+        snapshot_ts = snapshot_date(frame)
+    else:
+        raise ValueError("pass either `frame` or an explicit `snapshot`")
+    return snapshot_ts - pd.DateOffset(months=horizon_months + booking_lag_months)
+
+
+def default_label_within_horizon(
+    frame: pd.DataFrame,
+    *,
+    horizon_months: int = DEFAULT_HORIZON_MONTHS,
+    booking_lag_months: int = CHARGEOFF_BOOKING_LAG_MONTHS,
+    snapshot: str | pd.Timestamp | None = None,
+) -> pd.Series:
+    """Did this loan stop paying within `horizon_months` of origination?
+
+    1.0 = yes, 0.0 = no, NaN = the vintage is too recent to know yet.
+
+    WHY THIS AND NOT `default_label`
+    --------------------------------
+    `default_label` asks "has this loan defaulted by the snapshot date",
+    which is a question whose answer depends on how long the loan has been
+    observed. Older vintages have had years to fail; 2018 has had months. Any
+    performance metric computed that way is partly a measurement of vintage
+    age, so a genuine decline can present as an improvement — the 2018
+    vintage reads 14.7% against 2016's 24.3% purely because 90% of it has not
+    resolved.
+
+    A fixed horizon asks the same question of every vintage, so the answer is
+    comparable across them. It also *recovers* the 919k `Current` loans as
+    real negatives rather than discarding them: a loan that would have
+    defaulted inside the horizon would already be charged off, so one that is
+    still current has genuinely survived. Within the observable range there is
+    no maturity bias left to correct — not less of it, none.
+
+    The cost is stated plainly: this measures 24-month default, not lifetime
+    default, and 19.5% of eventual charge-offs happen after month 24 and are
+    labelled 0 here.
+
+    KNOWN RESIDUAL
+    --------------
+    A loan that stopped paying inside the horizon but is still `Late` rather
+    than `Charged Off` at snapshot is labelled 0. `horizon_maturity_report`
+    counts these so the size of the compromise is visible rather than
+    assumed; the booking-lag buffer exists to keep it small.
+    """
+    cutoff = maturity_cutoff(
+        frame,
+        horizon_months=horizon_months,
+        booking_lag_months=booking_lag_months,
+        snapshot=snapshot,
+    )
+
+    observable = frame[TIME_COLUMN] <= cutoff
+    stopped_paying = _months_between(frame[TIME_COLUMN], frame[LAST_PAYMENT_COLUMN])
+    bad_outcome = frame[STATUS_COLUMN].isin(RESOLVED_BAD)
+
+    label = pd.Series(np.nan, index=frame.index, dtype=float)
+    label[observable] = 0.0
+    label[observable & bad_outcome & (stopped_paying <= horizon_months)] = 1.0
+    # Charged off with no payment ever recorded: defaulted at month zero, which
+    # is inside every horizon. Left as NaN it would silently become a negative.
+    label[observable & bad_outcome & frame[LAST_PAYMENT_COLUMN].isna()] = 1.0
+    return label
+
+
+def matured_vintages(
+    frame: pd.DataFrame,
+    *,
+    horizon_months: int = DEFAULT_HORIZON_MONTHS,
+    booking_lag_months: int = CHARGEOFF_BOOKING_LAG_MONTHS,
+    snapshot: str | pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    """Rows whose horizon outcome is fully observable. The tail is cut, not weighted.
+
+    Reweighting or modelling the censored tail was considered and rejected: it
+    would put a modelling assumption underneath the ground truth that the
+    headline latency number is measured against, and a contested denominator
+    makes the whole result arguable.
+    """
+    cutoff = maturity_cutoff(
+        frame,
+        horizon_months=horizon_months,
+        booking_lag_months=booking_lag_months,
+        snapshot=snapshot,
+    )
+    return frame[frame[TIME_COLUMN] <= cutoff].copy()
+
+
+def horizon_maturity_report(
+    frame: pd.DataFrame,
+    *,
+    horizon_months: int = DEFAULT_HORIZON_MONTHS,
+    booking_lag_months: int = CHARGEOFF_BOOKING_LAG_MONTHS,
+    snapshot: str | pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    """Per-vintage comparison of the snapshot label against the horizon label.
+
+    Prints the bias next to its correction, including the residual censoring
+    the horizon rule does not fix (`still_late_in_horizon`).
+    """
+    horizon = default_label_within_horizon(
+        frame,
+        horizon_months=horizon_months,
+        booking_lag_months=booking_lag_months,
+        snapshot=snapshot,
+    )
+    snapshot_label = default_label(frame)
+    stopped_paying = _months_between(frame[TIME_COLUMN], frame[LAST_PAYMENT_COLUMN])
+    still_late = (
+        frame[STATUS_COLUMN].isin(UNRESOLVED)
+        & (frame[STATUS_COLUMN] != "Current")
+        & (stopped_paying <= horizon_months)
+        & horizon.notna()
+    )
+
+    out = pd.DataFrame(
+        {
+            "year": frame[TIME_COLUMN].dt.year,
+            "snapshot_label": snapshot_label,
+            "horizon_label": horizon,
+            "still_late": still_late,
+        }
+    )
+    grouped = out.groupby("year").agg(
+        n_loans=("snapshot_label", "size"),
+        snapshot_resolved_share=("snapshot_label", lambda s: s.notna().mean()),
+        snapshot_default_rate=("snapshot_label", "mean"),
+        horizon_labelled_share=("horizon_label", lambda s: s.notna().mean()),
+        horizon_default_rate=("horizon_label", "mean"),
+        still_late_in_horizon=("still_late", "sum"),
+    )
+    return grouped.round(4)
 
 
 def label_maturity_report(frame: pd.DataFrame) -> pd.DataFrame:

@@ -1,0 +1,7 @@
+signal,first_fire_window,first_fire_index,onset_window,onset_index,latency_windows,pre_onset_alert_rate,total_alert_rate,n_windows,persistence
+psi,2014-03,2.0,2014-03,2,0.0,0.0,0.8571428571428571,35,2
+ks,2014-01,0.0,2014-03,2,2.0,1.0,1.0,35,2
+wasserstein,2014-01,0.0,2014-03,2,2.0,1.0,1.0,35,2
+kl,2014-03,2.0,2014-03,2,0.0,0.0,0.8571428571428571,35,2
+prediction,,,2014-03,2,,0.0,0.0,35,2
+multivariate,2014-01,0.0,2014-03,2,2.0,1.0,1.0,35,2

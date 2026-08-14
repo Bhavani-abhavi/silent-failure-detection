@@ -135,7 +135,7 @@ class TestMinimumDetectableEffect:
             rng.normal(0, 1, 150),
             feature_name="x",
             window=WINDOW,
-            watch_threshold=0.05,  # below the 0.12 null expectation at n=150
+            min_effect_size=0.05,  # below the 0.12 null expectation at n=150
         )
         assert result.status is ResultStatus.NO_POWER
         assert "fires on sampling noise" in result.extra["reason"]

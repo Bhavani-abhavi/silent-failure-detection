@@ -6,12 +6,28 @@ touch labels or predictions. Everything here is domain-agnostic: callers
 pass plain arrays and a feature name; nothing here knows what the feature
 means.
 
-Thresholds set below (`watch_threshold`/`alert_threshold`) are heuristic
-defaults, not calibrated ones. Component 5 (alerting) is responsible for
-picking thresholds that hold a target false-positive rate on real stable
-periods, with multiple-testing correction across features and windows —
-these defaults exist so component 1 is independently testable and usable,
-not as the final word on severity.
+EVERY DETECTOR HERE REQUIRES TWO GATES TO FIRE
+==============================================
+
+`is_drifted` is true only when the shift is BOTH statistically distinguishable
+from sampling noise (`p_value < alpha`) AND large enough to matter
+(`statistic >= min_effect_size`). Neither alone is usable, and this codebase
+has measurements for both failure modes:
+
+- **Significance alone.** On real Lending Club windows (n ~ 40,000) the KS test
+  alerted on **81-94%** of feature-quarters while being correctly calibrated at
+  4.3% against a synthetic null. It is not broken; it is answering "is there
+  *any* difference", and on real credit data the answer is always yes. Multiple-
+  testing correction does not help — the family-wise error rate is not the
+  problem, the null being tested is.
+- **Effect size alone.** The conventional PSI 0.1/0.25 thresholds are a
+  sample-size artifact. At n=250 per window the 0.1 threshold sits on the noise
+  floor and false-alarms 14.6% of the time; at n=20,000 it sits 111x above the
+  floor, so the detector is effectively switched off while appearing to be on.
+
+So `min_effect_size` defaults remain provisional and should be calibrated per
+deployment against `minimum_detectable_effect`, which every result reports.
+What is *not* provisional is the requirement that both gates exist.
 """
 
 from __future__ import annotations
@@ -29,9 +45,13 @@ from drift_core.types import (
 from drift_core.validity import (
     check_windows,
     insufficient_data_result,
+    kl_p_value,
     ks_minimum_detectable_effect,
     n_valid,
+    permutation_p_value,
     psi_null_expectation,
+    psi_p_value,
+    require_detectable_alpha,
 )
 
 
@@ -184,12 +204,27 @@ def wasserstein(reference, current, *, normalize: bool = True) -> tuple[float, d
     return stat, {"raw_distance": raw, "reference_std": ref_std}
 
 
-def _severity(value: float, watch: float, alert: float) -> tuple[Severity, bool]:
-    if value >= alert:
+def _gated_severity(
+    statistic: float,
+    p_value: float,
+    *,
+    alpha: float,
+    min_effect_size: float,
+    alert_threshold: float,
+) -> tuple[Severity, bool]:
+    """Both gates, or nothing.
+
+    A statistically significant shift below `min_effect_size` is real and
+    operationally meaningless — it must not page anyone. A large-looking shift
+    that a null model reproduces routinely at this sample size is noise. Only
+    the intersection is worth acting on.
+    """
+    significant = np.isfinite(p_value) and p_value < alpha
+    if not significant or statistic < min_effect_size:
+        return Severity.NONE, False
+    if statistic >= alert_threshold:
         return Severity.ALERT, True
-    if value >= watch:
-        return Severity.WATCH, True
-    return Severity.NONE, False
+    return Severity.WATCH, True
 
 
 def detect_psi_drift(
@@ -200,7 +235,8 @@ def detect_psi_drift(
     window: WindowSpec,
     bins: int = 10,
     categorical: bool = False,
-    watch_threshold: float = 0.1,
+    alpha: float = 0.05,
+    min_effect_size: float = 0.1,
     alert_threshold: float = 0.25,
     min_samples: int = 30,
 ) -> DriftResult:
@@ -215,19 +251,27 @@ def detect_psi_drift(
     psi, extra = population_stability_index(
         reference, current, bins=bins, categorical=categorical
     )
-    severity, drifted = _severity(psi, watch_threshold, alert_threshold)
+    # Realized, not requested: quantile edges collapse on ties, and a heavily
+    # tied feature can end up with far fewer bins than asked for.
+    realized_bins = len(extra["reference_proportions"])
+    p_value = psi_p_value(psi, n_ref, n_cur, realized_bins)
+    severity, drifted = _gated_severity(
+        psi, p_value, alpha=alpha,
+        min_effect_size=min_effect_size, alert_threshold=alert_threshold,
+    )
 
     # The PSI a pair of identical distributions would produce at these sample
-    # sizes. If the watch threshold sits below it, the detector is measuring
-    # sampling noise and the severity below is not trustworthy.
-    noise_floor = psi_null_expectation(n_ref, n_cur, bins)
+    # sizes. If min_effect_size sits below it, the effect gate is not gating —
+    # it admits pure sampling noise and leaves alpha doing all the work.
+    noise_floor = psi_null_expectation(n_ref, n_cur, realized_bins)
     extra["null_expectation"] = noise_floor
+    extra["realized_bins"] = realized_bins
     status = (
-        ResultStatus.NO_POWER if watch_threshold < noise_floor else ResultStatus.OK
+        ResultStatus.NO_POWER if min_effect_size < noise_floor else ResultStatus.OK
     )
     if status is ResultStatus.NO_POWER:
         extra["reason"] = (
-            f"watch_threshold={watch_threshold} is below the null expectation "
+            f"min_effect_size={min_effect_size} is below the null expectation "
             f"{noise_floor:.4f} at n_ref={n_ref}, n_cur={n_cur}; this "
             f"configuration fires on sampling noise"
         )
@@ -238,6 +282,7 @@ def detect_psi_drift(
         statistic=psi,
         kind=DriftKind.DATA,
         window=window,
+        p_value=p_value,
         threshold=alert_threshold,
         is_drifted=drifted,
         severity=severity,
@@ -256,8 +301,20 @@ def detect_ks_drift(
     feature_name: str,
     window: WindowSpec,
     alpha: float = 0.05,
+    min_effect_size: float = 0.05,
+    alert_threshold: float = 0.1,
     min_samples: int = 30,
 ) -> DriftResult:
+    """Two-sample KS with an effect-size gate.
+
+    `min_effect_size` is in units of the KS statistic — the maximum vertical
+    gap between the two empirical CDFs, so 0.05 means "the distributions
+    disagree about where at least 5% of the mass sits". It defaults to a real
+    value rather than 0 because on this project's data KS at
+    significance-only alerted on 81-94% of feature-quarters. That behaviour is
+    correct and useless; the gate is what makes the detector answer a question
+    somebody would act on.
+    """
     n_ref, n_cur = n_valid(reference), n_valid(current)
 
     # Without this gate an all-NaN reference window returned
@@ -271,12 +328,16 @@ def detect_ks_drift(
         )
 
     statistic, p_value = ks_test(reference, current)
-    drifted = p_value < alpha
-    severity = Severity.ALERT if drifted else Severity.NONE
+    severity, drifted = _gated_severity(
+        statistic, p_value, alpha=alpha,
+        min_effect_size=min_effect_size, alert_threshold=alert_threshold,
+    )
 
     # KS is bounded by 1, so a critical value at or above 1 means even two
-    # completely disjoint distributions could not reach significance.
-    mde = ks_minimum_detectable_effect(n_ref, n_cur, alpha)
+    # completely disjoint distributions could not reach significance. The
+    # effect gate raises that floor: the detector cannot fire below
+    # min_effect_size either, whatever the p-value says.
+    mde = max(ks_minimum_detectable_effect(n_ref, n_cur, alpha), min_effect_size)
     status = ResultStatus.NO_POWER if mde >= 1.0 else ResultStatus.OK
 
     return DriftResult(
@@ -298,8 +359,9 @@ def detect_ks_drift(
             if status is ResultStatus.OK
             else {
                 "reason": (
-                    f"KS critical value {mde:.3f} >= 1.0 at n_ref={n_ref}, "
-                    f"n_cur={n_cur}; no difference is detectable at alpha={alpha}"
+                    f"effective KS floor {mde:.3f} >= 1.0 at n_ref={n_ref}, "
+                    f"n_cur={n_cur}, min_effect_size={min_effect_size}; no "
+                    f"difference is detectable at alpha={alpha}"
                 )
             }
         ),
@@ -312,11 +374,24 @@ def detect_wasserstein_drift(
     *,
     feature_name: str,
     window: WindowSpec,
-    watch_threshold: float = 0.1,
+    alpha: float = 0.05,
+    min_effect_size: float = 0.1,
     alert_threshold: float = 0.25,
     normalize: bool = True,
     min_samples: int = 30,
+    n_permutations: int = 199,
+    max_permutation_samples: int = 5000,
+    random_state: int | None = 0,
 ) -> DriftResult:
+    """Earth-mover distance with a permutation null.
+
+    Wasserstein has no usable closed-form two-sample null, so unlike PSI and
+    KL this one pays for its p-value. The null is built at
+    `max_permutation_samples` per side (see `permutation_p_value` for why the
+    observed statistic is recomputed at the same n), while the reported
+    `statistic` is the full-n effect size — the number the gate should be
+    tuned against.
+    """
     n_ref, n_cur = n_valid(reference), n_valid(current)
     valid, reason = check_windows(reference, current, min_samples=min_samples)
     if not valid:
@@ -325,17 +400,43 @@ def detect_wasserstein_drift(
             window=window, reason=reason, n_reference=n_ref, n_current=n_cur,
         )
 
+    # Knowable without touching the data, so it raises rather than returning a
+    # quiet no-drift result. This is the permutation-floor bug's home.
+    require_detectable_alpha(n_permutations, alpha)
+
     statistic, extra = wasserstein(reference, current, normalize=normalize)
-    severity, drifted = _severity(statistic, watch_threshold, alert_threshold)
+
+    ref_std = extra["reference_std"]
+    scale = ref_std if (normalize and ref_std > 1e-12) else 1.0
+
+    def _statistic(a, b):
+        return stats.wasserstein_distance(a, b) / scale
+
+    p_value, observed_capped, n_per_side = permutation_p_value(
+        reference, current, _statistic,
+        n_permutations=n_permutations,
+        max_samples=max_permutation_samples,
+        random_state=random_state,
+    )
+    extra["permutation_n_per_side"] = n_per_side
+    extra["statistic_at_permutation_n"] = observed_capped
+    extra["n_permutations"] = n_permutations
+
+    severity, drifted = _gated_severity(
+        statistic, p_value, alpha=alpha,
+        min_effect_size=min_effect_size, alert_threshold=alert_threshold,
+    )
     return DriftResult(
         feature_name=feature_name,
         method="wasserstein",
         statistic=statistic,
         kind=DriftKind.DATA,
         window=window,
+        p_value=p_value,
         threshold=alert_threshold,
         is_drifted=drifted,
         severity=severity,
+        minimum_detectable_effect=min_effect_size,
         n_reference=n_ref,
         n_current=n_cur,
         extra=extra,
@@ -350,10 +451,17 @@ def detect_kl_drift(
     window: WindowSpec,
     bins: int = 10,
     categorical: bool = False,
-    watch_threshold: float = 0.1,
-    alert_threshold: float = 0.25,
+    alpha: float = 0.05,
+    min_effect_size: float = 0.05,
+    alert_threshold: float = 0.125,
     min_samples: int = 30,
 ) -> DriftResult:
+    """KL(current || reference) with the halved PSI asymptotic as its null.
+
+    Effect-size defaults are half PSI's, because KL is one of the two halves
+    PSI sums — carrying PSI's 0.1/0.25 across unchanged would silently make
+    this detector twice as hard to trip.
+    """
     n_ref, n_cur = n_valid(reference), n_valid(current)
     valid, reason = check_windows(reference, current, min_samples=min_samples)
     if not valid:
@@ -363,18 +471,34 @@ def detect_kl_drift(
         )
 
     kl, extra = kl_divergence(reference, current, bins=bins, categorical=categorical)
-    severity, drifted = _severity(kl, watch_threshold, alert_threshold)
-    noise_floor = psi_null_expectation(n_ref, n_cur, bins)
+    realized_bins = len(extra["reference_proportions"])
+    p_value = kl_p_value(kl, n_ref, n_cur, realized_bins)
+    severity, drifted = _gated_severity(
+        kl, p_value, alpha=alpha,
+        min_effect_size=min_effect_size, alert_threshold=alert_threshold,
+    )
+    noise_floor = psi_null_expectation(n_ref, n_cur, realized_bins) / 2.0
     extra["null_expectation"] = noise_floor
+    extra["realized_bins"] = realized_bins
+    status = (
+        ResultStatus.NO_POWER if min_effect_size < noise_floor else ResultStatus.OK
+    )
+    if status is ResultStatus.NO_POWER:
+        extra["reason"] = (
+            f"min_effect_size={min_effect_size} is below the null expectation "
+            f"{noise_floor:.4f} at n_ref={n_ref}, n_cur={n_cur}"
+        )
     return DriftResult(
         feature_name=feature_name,
         method="kl_divergence",
         statistic=kl,
         kind=DriftKind.DATA,
         window=window,
+        p_value=p_value,
         threshold=alert_threshold,
         is_drifted=drifted,
         severity=severity,
+        status=status,
         minimum_detectable_effect=noise_floor,
         n_reference=n_ref,
         n_current=n_cur,

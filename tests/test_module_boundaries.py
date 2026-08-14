@@ -1,10 +1,18 @@
-"""Enforces the architectural rule that drift_core is domain-agnostic.
+"""Enforces two architectural boundaries.
 
-The import-linter contract in pyproject.toml covers this in CI. This test
-duplicates it deliberately so that `pytest` alone catches a violation — the
-boundary is the central claim of the project ("one drift core, three
-domains") and it should not be possible to break it and still have a green
-local test run.
+1. **`drift_core` is domain-agnostic.** The core must not know it is running
+   on credit data. If a new domain would require changing it, that is a
+   design failure and it goes in the findings log.
+
+2. **`estimation` cannot reach labels.** This one is not cosmetic. The
+   label-free estimators are validated by comparing their output against
+   matured labels, and an estimator with an import path to
+   `domains.finance.lending_club.default_label_within_horizon` could consume
+   the answer it is being graded on. Nothing at runtime would reveal it — the
+   estimates would simply be excellent — so the guard has to be structural.
+
+The import-linter contracts in pyproject.toml cover both in CI. These tests
+duplicate them deliberately so `pytest` alone catches a violation.
 """
 
 import ast
@@ -12,8 +20,13 @@ from pathlib import Path
 
 import pytest
 
-DRIFT_CORE = Path(__file__).resolve().parents[1] / "drift_core"
-FORBIDDEN_ROOTS = {"domains", "pipeline", "dashboard", "reports"}
+ROOT = Path(__file__).resolve().parents[1]
+DRIFT_CORE = ROOT / "drift_core"
+ESTIMATION = ROOT / "estimation"
+FORBIDDEN_ROOTS = {
+    "domains", "pipeline", "reports", "model", "estimation", "backtest",
+}
+ESTIMATION_FORBIDDEN_ROOTS = {"domains", "backtest", "reports"}
 
 
 def _imported_roots(path: Path) -> set[str]:
@@ -41,6 +54,38 @@ def test_drift_core_imports_nothing_domain_specific(module_path):
         f"stay domain-agnostic — if a domain needs something from the core, "
         f"the core grows a general parameter, not a domain import."
     )
+
+
+@pytest.mark.parametrize(
+    "module_path",
+    sorted(ESTIMATION.glob("*.py")),
+    ids=lambda p: p.name,
+)
+def test_estimation_cannot_reach_labels(module_path):
+    """A label-free estimator that can import a label source is not one.
+
+    Reference labels are legitimate and are *passed in* as arrays by the
+    caller — that is the production reality, where history is labelled and
+    the current window is not. What must not exist is a path by which this
+    package could fetch labels itself.
+    """
+    violations = _imported_roots(module_path) & ESTIMATION_FORBIDDEN_ROOTS
+    assert not violations, (
+        f"{module_path.name} imports {sorted(violations)}. An estimator that "
+        f"can reach the labels it is scored against invalidates component B, "
+        f"and the failure would look like unusually good results."
+    )
+
+
+def test_backtest_is_the_only_place_truth_and_estimates_meet():
+    """The scoring lives downstream of both, by construction.
+
+    `estimation` must not import `backtest`; the dependency runs the other
+    way. If it were ever reversed, an estimator could read the onset
+    definition it is being timed against.
+    """
+    for module_path in sorted(ESTIMATION.glob("*.py")):
+        assert "backtest" not in _imported_roots(module_path)
 
 
 BANNED_VOCABULARY = [
