@@ -585,22 +585,38 @@ too generous.
 | base rate | importance weighted | **4/35** | −19.2% | 30.5% | yes |
 | Brier | importance weighted | 4/35 | −18.0% | 28.5% | yes |
 
-**Not blind — anti-correlated.** Correlation between the label-free estimate
-and the truth it is estimating:
+**Blind, not inverted.** *(This paragraph was rewritten on 2026-08-14 after the
+original "anti-correlated" claim failed verification — see the correction entry
+dated below. The numbers here are the ones that survive.)*
 
-- base rate: **r = −0.38**
-- Brier: **r = −0.46**
+The estimate is **flat while the truth moves**:
 
-The estimate moved *against* the truth. As the model's real performance
-decayed, the estimator reported it improving. A flat estimator would have been
-uninformative; this one is actively misleading, and a monitoring system built
-on it would have produced a reassuring downward trend line through the worst
-of the degradation.
+| | Newey-West HAC slope per window | p | 95% CI |
+|---|---|---|---|
+| true base rate | **+0.000753** | **0.0002** | [+0.00036, +0.00115] |
+| estimate | −0.000208 | 0.099 | [−0.00046, +0.00004] |
+| **gap (truth − estimate)** | **+0.000962** | **0.0016** | [+0.00037, +0.00156] |
 
-The mechanism is visible in one number: `corr(mean predicted risk, true base
-rate) = −0.38`. Mean predicted risk drifted 0.1007 → 0.0897 → 0.0997 while the
-true base rate went 0.1056 → 0.1466. The estimators are functionals of the
-predicted probabilities, so they inherit that sign exactly.
+The truth trends up robustly. The estimate has no statistically detectable
+trend at all. The gap between them widens significantly, from +0.0048 in the
+first window to a maximum of +0.0512.
+
+And it is biased low in **every single window**: 35/35 below truth, sign test
+p = 5.8×10⁻¹¹, and still p = 2.4×10⁻⁴ if the whole series is conservatively
+discounted to the 13 effectively independent observations that its serial
+correlation implies.
+
+**It does track short-run movement, which makes the failure more specific.**
+Correlation of *first differences* — month-over-month change in the estimate
+against month-over-month change in the truth — is **r = +0.75** (n = 34,
+serial-correlation-adjusted p = 1.2×10⁻⁵; the differenced series are
+near-white, lag-1 −0.43 and −0.32, so this test is trustworthy in a way the
+level correlation was not).
+
+So the estimator is responsive to month-to-month fluctuation and completely
+without purchase on the secular drift. It is not lying about the direction of
+change; it simply never moves far enough, in a world that kept moving. For
+degradation monitoring that is the useless half of the job to get right.
 
 **Importance weighting did not rescue it, and the way it failed is the useful
 part.** This was the sharp experiment: importance weighting is *valid* under
@@ -733,6 +749,95 @@ assumes a model that works for a while and then breaks. This model was
 degrading from the moment it was deployed, which is what "the world was already
 moving when you trained" looks like — and it is probably the common case rather
 than the exception.
+
+---
+
+## 2026-08-14 — CORRECTION: "anti-correlated" did not survive verification. I over-claimed.
+
+**What was claimed** in the component B entry above, a few hours earlier: that
+the label-free estimator was *anti-correlated* with the truth (r = −0.38 for
+base rate, −0.46 for Brier, both with n = 35 windows), and therefore "not
+blind but actively misleading — as the model decayed the estimator reported
+improvement."
+
+**What happened when it was tested properly:** it fails. The 35 observations
+are consecutive months and **both series are strongly autocorrelated** (lag-1
++0.65 for the estimate, +0.71 for the truth). A Pearson test assumes
+independent observations; correlating two serially dependent, trending series
+is the oldest way to manufacture significance out of nothing.
+
+| test | base rate | Brier |
+|---|---|---|
+| naive Pearson | r = −0.38, **p = 0.023**, 95% CI [−0.635, −0.058] | r = −0.46, p = 0.006, CI [−0.685, −0.145] |
+| effective n after serial-correlation correction | **13.0** of 35 | **12.3** of 35 |
+| adjusted p | **0.195** | **0.130** |
+| adjusted 95% CI | **[−0.771, +0.212]** | [−0.816, +0.160] |
+| moving-block bootstrap 95% CI | **[−0.730, +0.280]** | [−0.778, +0.244] |
+| first differences (trend removed) | **r = +0.748** | r = +0.747 |
+
+Three independent ways of saying the same thing: **not significant.** The
+adjusted interval spans zero comfortably, the block bootstrap spans zero, and
+— most damning — *the sign flips* once the trend is differenced out. The
+negative level correlation was two diverging trends, not a relationship.
+
+**Why this one stings.** This project's entire subject is guardrails that
+report a clean result while being structurally unable to see the problem. I
+built four such guardrails into the detectors, wrote a section of the README
+about the pattern, and then committed the identical error in the write-up: a
+p-value computed downstream of an assumption that removes the evidence it
+would need to be valid. The code was more careful than the prose about it.
+
+It also would have been the single easiest thing for a reviewer to knock down.
+Recomputing a correlation from a committed CSV takes about a minute.
+
+**What replaced it** (all serial-correlation-robust, all in
+`scripts/verify_correlation.py`, all reproducible from
+`reports/backtest/estimation_error.csv`):
+
+1. **Systematic underestimation — robust.** 35/35 windows below truth. Sign
+   test p = 5.8×10⁻¹¹; still 2.4×10⁻⁴ discounted to 13 effectively independent
+   observations. Mean relative error −23.4%.
+2. **The gap widens — robust.** Newey-West HAC slope on (truth − estimate) =
+   **+0.000962/window, p = 0.0016**, 95% CI [+0.00037, +0.00156]. Gap grows
+   +0.0048 → +0.0512 max.
+3. **The truth trends, the estimate does not.** Truth HAC slope +0.000753,
+   p = 0.0002. Estimate HAC slope −0.000208, **p = 0.099, CI includes zero.**
+   So "the estimator reported improvement" is *also* not supportable — it
+   reported approximately nothing, which is a different and more accurate
+   accusation.
+4. **Short-run tracking is real.** First-difference r = +0.75, adjusted
+   p = 1.2×10⁻⁵. The differenced series are near-white (lag-1 −0.43, −0.32),
+   so unlike the level correlation this test can be believed.
+
+**The defensible summary, which is the one that was predicted in advance
+anyway:** the estimator is *blind*, not inverted. It moves with month-to-month
+fluctuation and not at all with the drift, while sitting 23% low in every
+window. The original prediction in the AUC/calibration entry — "structurally
+blind" — was right. The overclaim was mine, added after seeing a correlation
+coefficient and not testing it.
+
+**Method notes, recorded because two plausible tests are wrong here:**
+
+- A *block bootstrap of the trend slope* is invalid. Resampling blocks and
+  regressing them against a fixed time index scrambles the ordering and
+  destroys any trend by construction; it returns "CI includes zero" for
+  everything and looks rigorous doing it. This was tried first and discarded.
+  Newey-West HAC standard errors are the right tool.
+- A *t-test on first differences* is near-useless for a trend: the mean first
+  difference reduces to `(last − first)/(n−1)`, so it is an endpoint
+  comparison carrying month-to-month variance. It returns p = 0.63 on the
+  truth series that HAC OLS resolves at p = 0.0002.
+
+**Coda — the fix itself shipped the bug once more.** The first version of
+`sign_test`, discounting 35/35 to an effective n of 13.02, scaled the majority
+count against the unrounded float and took a ceiling. That pushed successes
+above the trial count, and `binom.sf(n, n, 0.5)` is exactly **0** — so it
+printed `p = 0` for a result whose correct discounted value is 2.4×10⁻⁴. A
+p-value of zero is not attainable by any finite test, and it appeared in the
+very function written to stop this project from over-claiming. Caught before
+the write-up, fixed by rounding the sample size first and clamping, and pinned
+by `test_non_integer_override_never_yields_p_equal_zero`. Five instances now.
+The pattern is not a bug type; it is a blind spot in how I check things.
 
 ---
 
