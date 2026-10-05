@@ -27,3 +27,9 @@ htmlcov/
 .DS_Store
 .vscode/
 .idea/
+
+# MLflow local tracking store
+mlruns/
+mlartifacts/
+.jdk/
+mlflow.db

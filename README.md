@@ -278,12 +278,50 @@ alpha=0.05 is 2.5–3.2% for both across n = 1,000 to 20,000.
 
 Time-based splits only. There is no random-split option anywhere.
 
+## Scaling out: Spark PSI and MLflow run tracking
+
+Two optional extras, neither of which changes any number above.
+
+**`pipeline/spark_drift.py`: per-window PSI in PySpark.** The NumPy detectors
+hold each window in memory, which is fine at 1M loans and will not be at 100M.
+The Spark version keeps the same statistic and splits the work by where it
+scales: bin edges are fit on the driver from the reference window, using the
+same `_quantile_bin_edges` as the NumPy path, because Spark's `approxQuantile`
+returns observed values rather than interpolating and would quietly change
+every bin. Every monitoring row is then bucketed and counted per
+(window, feature, bin) in one distributed `groupBy`. Only the count table
+comes back to the driver.
+
+Parity is tested, not assumed: `tests/pipeline/test_spark_drift.py` checks
+Spark against `population_stability_index` to **1e-12** on synthetic data that
+exercises every edge the NumPy path handles on purpose: NaNs dropped per
+feature, values beyond the reference range, a constant feature (degenerate
+edges) that later moves, a categorical feature that gains a new category, and
+a window below `min_rows`. `scripts/spark_drift_report.py` runs it over the
+full Lending Club panel and re-checks every value against NumPy on the real
+data.
+
+**`reports/tracking.py`: MLflow experiment tracking.** `run_backtest.py
+--mlflow` logs each run's frozen settings as params, the per-window truth
+metrics and signal flags as step-indexed series (so the UI plots them over
+deployment time), latency and estimation-error summaries as scalars, and the
+report CSVs as artifacts. Undefined values are skipped rather than logged as
+NaN, which MLflow would draw as zero.
+
+```bash
+# Spark needs a full JDK 17 or 21 on JAVA_HOME
+./.venv/Scripts/python.exe -m pip install -e ".[dev,spark,tracking]"
+./.venv/Scripts/python.exe scripts/spark_drift_report.py        # Spark PSI + NumPy cross-check
+./.venv/Scripts/python.exe scripts/run_backtest.py --mlflow     # backtest, logged to ./mlflow.db
+./.venv/Scripts/mlflow.exe ui --backend-store-uri sqlite:///mlflow.db   # compare runs
+```
+
 ## Running it
 
 ```bash
 python -m venv .venv
 ./.venv/Scripts/python.exe -m pip install -e ".[dev]"
-./.venv/Scripts/python.exe -m pytest tests/ -q          # 308 tests
+./.venv/Scripts/python.exe -m pytest tests/ -q          # 317 tests (Spark tests need a JDK; skipped without one)
 ./.venv/Scripts/lint-imports.exe                        # boundary contracts
 
 # Put loan.csv (Lending Club 2007-2018, ~1.1 GB) in data/raw/, then:

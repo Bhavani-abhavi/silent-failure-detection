@@ -14,6 +14,12 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-cov>=5.0", "import-linter>=2.0"]
+# Distributed PSI over monitoring windows (pipeline/spark_drift.py). Needs a
+# full JDK 17 or 21 on JAVA_HOME (Spark 4 loads jdk.incubator.vector, which
+# trimmed runtimes such as jdk4py do not ship).
+spark = ["pyspark>=4.0"]
+# Experiment tracking for backtest runs (reports/tracking.py).
+tracking = ["mlflow>=3.0"]
 
 [tool.setuptools]
 packages = [

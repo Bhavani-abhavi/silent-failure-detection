@@ -1,0 +1,27 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      # PySpark needs a JVM. setup-java sets JAVA_HOME, so the bundled jdk4py
+      # runtime is not used in CI.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Install
+        run: pip install -e ".[dev,spark,tracking]"
+      - name: Import contracts
+        run: lint-imports
+      - name: Tests
+        run: pytest -q

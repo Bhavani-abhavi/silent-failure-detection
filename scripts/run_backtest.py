@@ -1,6 +1,7 @@
 """Produce the headline: detection latency per unsupervised signal.
 
     .venv/Scripts/python.exe scripts/run_backtest.py
+    .venv/Scripts/python.exe scripts/run_backtest.py --mlflow   # also log the run to MLflow
 
 Design decisions worth stating, because they constrain what the number means:
 
@@ -18,6 +19,7 @@ only one threshold setting is not a finding.
 
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 
 import numpy as np
@@ -62,7 +64,13 @@ def _monthly(frame, labels, predictions, time_column):
     return windows
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--mlflow", action="store_true",
+                        help="also log this run to MLflow (needs the 'tracking' extra)")
+    parser.add_argument("--tracking-uri", default="sqlite:///mlflow.db",
+                        help="MLflow tracking URI (default: local SQLite store, ./mlflow.db)")
+    args = parser.parse_args(argv)
     OUT.mkdir(parents=True, exist_ok=True)
 
     frame = lc.load(era=ERA)
@@ -238,6 +246,38 @@ def main() -> None:
         pre = flags[: onset.onset_index] if onset.onset_index else flags
         print(f"  {signal.replace('_fired', ''):<16}"
               f" {false_positive_rate(pre):6.1%}  ({len(pre)} windows)")
+
+    if args.mlflow:
+        from reports.tracking import log_backtest_run
+
+        params = {
+            "era": ERA, "era_start": ERA_START, "train_end": TRAIN_END,
+            "reference_end": REFERENCE_END, "freq": FREQ,
+            "onset_metric": ONSET_METRIC, "onset_direction": ONSET_DIRECTION,
+            "onset_n_sd": ONSET_N_SD, "onset_persistence": ONSET_PERSISTENCE,
+            "n_numeric_features": len(numeric), "n_windows": len(window_ids),
+        }
+        params.update({f"reference_{k}": v for k, v in model.reference_metrics.items()})
+        fired = result.signals.reindex(columns=[s for s in SIGNALS if s in result.signals.columns])
+        window_metrics = result.truth.join(fired.astype(float))
+        summary_metrics = {
+            f"latency_{latency.signal}": latency.latency_windows for latency in latencies
+        }
+        summary_metrics.update({
+            f"pre_onset_alert_rate_{latency.signal}": latency.pre_onset_alert_rate
+            for latency in latencies
+        })
+        summary_metrics.update({
+            f"mean_error_{row.metric}_{row.method}": row.mean_error
+            for row in summary.itertuples() if hasattr(row, "mean_error")
+        })
+        run_id = log_backtest_run(
+            params=params, window_metrics=window_metrics, summary_metrics=summary_metrics,
+            artifacts=sorted(OUT.glob("*.csv")), run_name=f"backtest-{ERA}-{FREQ}",
+            tracking_uri=args.tracking_uri,
+        )
+        print(f"
+MLflow run logged: {run_id}")
 
 
 def _null_alert_rates(reference_frame, feature_names, *, n_splits=20):
