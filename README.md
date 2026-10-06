@@ -1,5 +1,21 @@
 # Silent Failure Detection for Production ML
 
+[![tests](https://github.com/Bhavani-abhavi/silent-failure-detection/actions/workflows/tests.yml/badge.svg)](https://github.com/Bhavani-abhavi/silent-failure-detection/actions/workflows/tests.yml)
+
+<p align="center"><img src="docs/media/sfd_results.gif" width="420" alt="AUC stayed flat while the calibration gap widened 27x"></p>
+
+**At a glance**
+
+- **Question:** can you tell a production model is failing before its labels arrive?
+- **Setup:** a frozen credit-default model replayed over 35 monthly windows of real Lending Club data (1,054,948 loans), monitored with unsupervised signals only, then graded against labels that arrived two years later.
+- **Finding:** AUC stayed flat (0.672 to 0.666) while the Brier score rose 17% and the calibration gap widened 27x. At the worst point the model understated portfolio default risk by about 36%.
+- **Rigor:** a pre-onset alert-rate metric so an always-on detector cannot claim lead time, autocorrelation-corrected significance (one of my own claims did not survive and is retracted below), and label isolation enforced with import-linter contracts.
+- **Stack:** Python, scikit-learn, SciPy, PySpark (parity-tested against NumPy to 1e-12), MLflow, pytest, GitHub Actions.
+
+The full write-up follows.
+
+---
+
 A credit-default model, frozen after training on 2013 H1, deployed across 35
 monthly windows of Lending Club originations (1,054,948 loans, 2014-01 to
 2016-11), monitored with **unsupervised signals only** — then graded against
